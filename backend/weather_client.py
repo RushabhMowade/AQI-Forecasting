@@ -1,10 +1,11 @@
-"""72-hour weather forecast from Open-Meteo (no key required), with a
-synthetic seasonal fallback if the request fails."""
+"""Daily wind-speed forecast from Open-Meteo (no key required), used only to
+shape the multi-day AQI outlook heuristic (see forecast_engine.build_outlook).
+Falls back to a flat neutral assumption if the request fails."""
 import datetime
 import requests
 
 
-def fetch_weather_forecast(lat: float, lon: float) -> dict:
+def fetch_daily_wind_forecast(lat: float, lon: float, days: int = 4) -> dict:
     url = "https://api.open-meteo.com/v1/forecast"
     try:
         res = requests.get(
@@ -12,27 +13,19 @@ def fetch_weather_forecast(lat: float, lon: float) -> dict:
             params={
                 "latitude": lat,
                 "longitude": lon,
-                "hourly": "temperature_2m,relative_humidity_2m,wind_speed_10m",
-                "forecast_days": 3,
+                "daily": "wind_speed_10m_max",
+                "forecast_days": days,
+                "timezone": "auto",
             },
             timeout=6,
         ).json()
-        hourly = res["hourly"]
-        timestamps = hourly["time"][:72]
-        temp = hourly["temperature_2m"][:72]
-        humidity = hourly["relative_humidity_2m"][:72]
-        wind = hourly["wind_speed_10m"][:72]
-        if len(timestamps) < 72:
+        daily = res["daily"]
+        dates = daily["time"][:days]
+        wind = daily["wind_speed_10m_max"][:days]
+        if len(dates) < days:
             raise ValueError("Incomplete forecast payload")
-        return {"timestamps": timestamps, "temp": temp, "humidity": humidity, "wind": wind, "source": "live"}
+        return {"dates": dates, "wind": wind, "source": "live"}
     except Exception:
-        now = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
-        timestamps = [(now + datetime.timedelta(hours=i)).isoformat() for i in range(72)]
-        import math
-        return {
-            "timestamps": timestamps,
-            "temp": [28.0 + 4 * math.sin(i / 6) for i in range(72)],
-            "humidity": [60.0 + 10 * math.cos(i / 6) for i in range(72)],
-            "wind": [12.0 + 3 * math.sin(i / 12) for i in range(72)],
-            "source": "synthetic",
-        }
+        today = datetime.date.today()
+        dates = [(today + datetime.timedelta(days=i)).isoformat() for i in range(days)]
+        return {"dates": dates, "wind": [10.0] * days, "source": "synthetic"}
