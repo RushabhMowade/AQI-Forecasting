@@ -11,7 +11,7 @@ export default function Banner({ peak }) {
     >
       <span className="text-base leading-none">{icon}</span>
       <span className="text-ink">
-        Peak forecast: <span className="font-mono" style={{ color: peak.color }}>{Math.round(peak.value)}</span> ({peak.label}) around hour {peak.hour} of the 72-hour window.
+        Peak in outlook: <span className="font-mono" style={{ color: peak.color }}>{Math.round(peak.value)}</span> ({peak.label}), day {peak.day + 1} of the outlook.
       </span>
     </div>
   )

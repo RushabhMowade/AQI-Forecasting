@@ -1,14 +1,33 @@
-"""Model loading + the 72-hour autoregressive forecast loop."""
+"""
+v2 -- retrained on a genuine target. See /home/claude/retrain/retrain.py
+(the retraining script) for the full diagnosis and methodology. Summary:
+
+- The original 'AQI' column in Air_quality_data.csv had ~0 correlation with
+  its own pollutant columns and ~0 day-to-day autocorrelation -- it wasn't
+  learnable. Replaced with a real CPCB composite AQI (max of the 7 official
+  pollutant sub-indices) computed directly from PM2.5/PM10/NO2/SO2/CO/O3/NH3.
+- aqi_dataset.csv (weather/traffic/industrial) has no City or Datetime
+  column, so there's no way to join it correctly -- dropped entirely.
+- Calendar features (month, day-of-week) and lag features were tested and
+  showed ~0.0000 feature importance -- this dataset has no real seasonal or
+  persistence structure (checked: flat monthly means, ~0 autocorrelation).
+  Dropped rather than kept as decorative dead weight.
+
+Result: a 9-feature model (just the pollutants) that maps concentrations to
+AQI with MAE 0.78 / R^2 99.96% on held-out data -- because that mapping IS
+close to a deterministic function (the CPCB formula), and the model learned
+it well. PM2.5 + PM10 carry ~97% of the decision.
+
+What this model does NOT do: predict how AQI changes over time. There's no
+such signal in the source data. The "outlook" below is explicitly a
+heuristic layered on top of live weather forecasts (real, forward-looking
+data), not a learned prediction -- and is labeled as such in the API.
+"""
 import pickle
-import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
-FEATURE_ORDER = [
-    'PM2.5', 'PM10', 'NO', 'NO2', 'NOx', 'NH3', 'CO', 'SO2', 'O3',
-    'temperature', 'humidity', 'wind_speed', 'traffic_density', 'industrial_activity',
-    'AQI_lag_1h', 'AQI_lag_2h', 'AQI_lag_24h', 'Hour_sin', 'Hour_cos'
-]
+FEATURE_ORDER = ['PM2.5', 'PM10', 'NO', 'NO2', 'NOx', 'NH3', 'CO', 'SO2', 'O3']
 
 AQI_BANDS = [
     (0, 50, "Good", "#3DDC84"),
@@ -27,96 +46,52 @@ def aqi_category(value: float):
     return ("Severe", "#8B1E2D") if value > 500 else ("Good", "#3DDC84")
 
 
-# CPCB breakpoint tables for a quick, real sub-index estimate — used only to
-# seed the autoregressive lag features with something derived from the actual
-# pollutant readings, instead of a fixed made-up starting AQI.
-PM25_BREAKPOINTS = [(0, 30, 0, 50), (30, 60, 50, 100), (60, 90, 100, 200),
-                    (90, 120, 200, 300), (120, 250, 300, 400), (250, 380, 400, 500)]
-PM10_BREAKPOINTS = [(0, 50, 0, 50), (50, 100, 50, 100), (100, 250, 100, 200),
-                    (250, 350, 200, 300), (350, 430, 300, 400), (430, 500, 400, 500)]
-
-
-def _sub_index(conc: float, breakpoints):
-    for lo_c, hi_c, lo_i, hi_i in breakpoints:
-        if lo_c <= conc <= hi_c:
-            return lo_i + (hi_i - lo_i) * (conc - lo_c) / (hi_c - lo_c)
-    last = breakpoints[-1]
-    return last[3]  # cap at top of scale for anything above the table
-
-
-def estimate_seed_aqi(live_pollutants: dict) -> float:
-    """A rough, real CPCB-style AQI estimate from current PM2.5/PM10, used to
-    seed the forecast's lag features instead of a hardcoded constant. Not a
-    certified AQI calculation (only 2 of 8 sub-indices), but real and
-    city/time-sensitive rather than fixed."""
-    pm25_idx = _sub_index(live_pollutants.get('PM2.5', 0), PM25_BREAKPOINTS)
-    pm10_idx = _sub_index(live_pollutants.get('PM10', 0), PM10_BREAKPOINTS)
-    return max(pm25_idx, pm10_idx)
-
-
-def load_artifacts(model_json="model.json", model_pkl="model.pkl", scaler_pkl="scaler.pkl"):
-    """Prefers the native XGBoost json format (stable across library versions),
-    falls back to the pickle."""
+def load_artifacts(model_json="model.json", scaler_pkl="scaler.pkl"):
     model = XGBRegressor()
-    try:
-        model.load_model(model_json)
-    except Exception:
-        with open(model_pkl, "rb") as f:
-            model = pickle.load(f)
-
+    model.load_model(model_json)
     with open(scaler_pkl, "rb") as f:
         scaler = pickle.load(f)
-
     return model, scaler
 
 
-def run_forecast(model, scaler, live_pollutants: dict, weather_forecast: dict, seed_aqi: float = None):
+def predict_aqi(model, scaler, pollutants: dict) -> float:
+    """Single-point prediction: pollutant concentrations -> AQI."""
+    row = pd.DataFrame([{k: pollutants[k] for k in FEATURE_ORDER}], columns=FEATURE_ORDER)
+    scaled = scaler.transform(row)
+    return max(0.0, float(model.predict(scaled)[0]))
+
+
+def wind_dispersion_factor(wind_kmh: float) -> float:
+    """Heuristic, NOT learned by the model: higher wind -> better dispersion
+    -> lower concentration. ~10 km/h treated as neutral. Used only to shape
+    the multi-day outlook from real forecast wind speed, since the model
+    itself has no time-dynamics to draw on."""
+    factor = 1.25 - 0.03 * wind_kmh
+    return max(0.6, min(1.3, factor))
+
+
+def apply_reduction(pollutants: dict, reduction_pct: float) -> dict:
+    """Intervention lever: uniformly scales down pollutant concentrations.
+    This is the one lever the model responds strongly to (PM2.5+PM10 are
+    ~97% of its decision) -- used by /api/scenario to quantify "what would a
+    combined source-reduction effort of X% do to AQI"."""
+    mult = 1.0 - max(0.0, min(100.0, reduction_pct)) / 100.0
+    return {k: v * mult for k, v in pollutants.items()}
+
+
+def build_outlook(model, scaler, live_pollutants: dict, daily_wind_kmh: list, reduction_pct: float = 0.0):
     """
-    Autoregressive 72-hour forecast. Keeps a rolling history of predictions so
-    AQI_lag_1h / AQI_lag_2h / AQI_lag_24h are always the real values from
-    1h / 2h / 24h before the point being predicted, instead of being frozen.
-
-    seed_aqi seeds that history before hour 0. If not given, it's estimated
-    from the actual pollutant readings (see estimate_seed_aqi) so two cities
-    with different conditions don't start from the same fictitious baseline.
+    Multi-day outlook. NOT a learned time-series forecast (the model has no
+    temporal signal to draw on -- see module docstring) -- each day re-runs
+    the real, accurate concentration->AQI model on the live reading adjusted
+    by that day's real forecast wind speed via a labeled heuristic, plus any
+    intervention reduction. Returns a list of predicted AQI values, one per
+    entry in daily_wind_kmh.
     """
-    if seed_aqi is None:
-        seed_aqi = estimate_seed_aqi(live_pollutants)
-
-    history = [seed_aqi - 15.0] * 24 + [seed_aqi - 5.0, seed_aqi]
-    predictions = []
-    timestamps = weather_forecast["timestamps"]
-
-    for i in range(72):
-        ts = pd.to_datetime(timestamps[i])
-        hour_sin = np.sin(2 * np.pi * ts.hour / 24.0)
-        hour_cos = np.cos(2 * np.pi * ts.hour / 24.0)
-
-        lag_1h, lag_2h, lag_24h = history[-1], history[-2], history[-24]
-
-        feature_dict = {
-            'PM2.5': live_pollutants['PM2.5'], 'PM10': live_pollutants['PM10'],
-            'NO': live_pollutants['NO'], 'NO2': live_pollutants['NO2'],
-            'NOx': live_pollutants['NOx'], 'NH3': live_pollutants['NH3'],
-            'CO': live_pollutants['CO'], 'SO2': live_pollutants['SO2'],
-            'O3': live_pollutants['O3'],
-            'temperature': weather_forecast['temp'][i],
-            'humidity': weather_forecast['humidity'][i],
-            'wind_speed': weather_forecast['wind'][i],
-            'traffic_density': 0.5,
-            'industrial_activity': 0.4,
-            'AQI_lag_1h': lag_1h,
-            'AQI_lag_2h': lag_2h,
-            'AQI_lag_24h': lag_24h,
-            'Hour_sin': hour_sin,
-            'Hour_cos': hour_cos,
-        }
-
-        row_df = pd.DataFrame([feature_dict], columns=FEATURE_ORDER)
-        row_scaled = scaler.transform(row_df)
-        pred_aqi = max(0.0, float(model.predict(row_scaled)[0]))
-
-        predictions.append(pred_aqi)
-        history.append(pred_aqi)
-
-    return predictions
+    reduced = apply_reduction(live_pollutants, reduction_pct)
+    results = []
+    for wind in daily_wind_kmh:
+        dispersion = wind_dispersion_factor(wind)
+        day_pollutants = {k: v * dispersion for k, v in reduced.items()}
+        results.append(predict_aqi(model, scaler, day_pollutants))
+    return results

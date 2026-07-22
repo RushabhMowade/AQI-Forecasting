@@ -1,17 +1,21 @@
 import { useEffect, useState } from 'react'
-import { fetchCities, fetchForecast } from './api'
+import { fetchCities, fetchForecast, fetchInterventions } from './api'
 import CitySelector from './components/CitySelector'
 import AQIGauge from './components/AQIGauge'
 import PollutantGrid from './components/PollutantGrid'
 import ForecastChart from './components/ForecastChart'
 import Banner from './components/Banner'
 import InfoPanel from './components/InfoPanel'
+import InterventionPanel from './components/InterventionPanel'
+import ScenarioSimulator from './components/ScenarioSimulator'
 
 export default function App() {
   const [cities, setCities] = useState([])
   const [city, setCity] = useState('')
   const [data, setData] = useState(null)
+  const [interventions, setInterventions] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [interventionsLoading, setInterventionsLoading] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -26,24 +30,30 @@ export default function App() {
   async function runForecast() {
     if (!city) return
     setLoading(true)
+    setInterventionsLoading(true)
     setError('')
     try {
-      const result = await fetchForecast(city)
+      const [result, plan] = await Promise.all([
+        fetchForecast(city),
+        fetchInterventions(city).catch(() => null),
+      ])
       setData(result)
+      setInterventions(plan)
     } catch (e) {
       setError(e.message)
     } finally {
       setLoading(false)
+      setInterventionsLoading(false)
     }
   }
 
   return (
     <div className="min-h-screen bg-base text-ink font-sans">
-      <div className="max-w-4xl mx-auto px-5 py-8">
+      <div className="max-w-5xl mx-auto px-5 py-8">
         <header className="flex items-center justify-between flex-wrap gap-4 mb-8">
           <div>
-            <h1 className="font-display text-2xl">Hyperlocal AQI Forecast</h1>
-            <p className="text-sm text-muted mt-1">72-hour air quality projection from live CPCB readings and weather</p>
+            <h1 className="font-display text-2xl">AQI Intelligence & Intervention Console</h1>
+            <p className="text-sm text-muted mt-1">Live CPCB-driven AQI, source attribution, and a quantified intervention simulator</p>
           </div>
           {cities.length > 0 && (
             <CitySelector cities={cities} value={city} onChange={setCity} onSubmit={runForecast} loading={loading} />
@@ -67,15 +77,28 @@ export default function App() {
             <Banner peak={data.peak} />
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="bg-panel border border-hairline rounded-xl p-4 flex items-center justify-center">
+              <div className="bg-panel border border-hairline rounded-xl p-4 flex flex-col items-center justify-center">
                 <AQIGauge value={data.current.value} label={data.current.label} color={data.current.color} city={data.city} />
+                <p className="text-[11px] text-muted mt-3 text-center">
+                  Computed by the retrained model from live pollutant readings (MAE 0.78, R² 99.96% on held-out data).
+                </p>
+                {data.reference_aqi != null && (
+                  <div className="mt-2 px-3 py-1.5 rounded-lg bg-raised border border-hairline text-xs text-center">
+                    <span className="text-muted">Official reading (WAQI/CPCB): </span>
+                    <span className="font-mono text-ink">{Math.round(data.reference_aqi)}</span>
+                  </div>
+                )}
               </div>
               <div className="bg-panel border border-hairline rounded-xl p-4">
                 <PollutantGrid pollutants={data.pollutants} source={data.data_sources?.pollutants} />
               </div>
             </div>
 
-            <ForecastChart timestamps={data.timestamps} predictions={data.predictions} />
+            <ForecastChart dates={data.dates} outlook={data.outlook} />
+
+            <InterventionPanel data={interventions} loading={interventionsLoading} />
+
+            <ScenarioSimulator city={city} />
 
             <InfoPanel sources={data.data_sources} />
           </div>

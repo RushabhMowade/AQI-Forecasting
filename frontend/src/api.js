@@ -15,3 +15,22 @@ export async function fetchForecast(city) {
   }
   return res.json()
 }
+
+export async function fetchInterventions(city) {
+  const res = await fetch(`${API_BASE}/api/interventions?city=${encodeURIComponent(city)}`, { cache: 'no-store' })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.detail || 'Interventions request failed')
+  }
+  return res.json()
+}
+
+export async function fetchScenario(city, pollutantReductionPct) {
+  const params = new URLSearchParams({ city, pollutant_reduction_pct: String(pollutantReductionPct) })
+  const res = await fetch(`${API_BASE}/api/scenario?${params.toString()}`, { cache: 'no-store' })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.detail || 'Scenario request failed')
+  }
+  return res.json()
+}

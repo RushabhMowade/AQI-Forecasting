@@ -1,41 +1,96 @@
 """
-Live pollutant readings from the CPCB "Real Time Air Quality Index" feed,
-published on data.gov.in.
+Live pollutant readings, tried in this order:
 
-Resource: https://www.data.gov.in/resource/real-time-air-quality-index-various-locations
-Resource ID: 3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69
+  1. WAQI (World Air Quality Index / aqicn.org) — fast, free, instant token,
+     aggregates 586+ real CPCB stations across India (explicitly attributed
+     to "CPCB - India Central Pollution Control Board" in its own API
+     responses). Get a token in seconds at https://aqicn.org/data-platform/token
+     (just an email, no government SSO). Put it in backend/.env as
+     WAQI_API_TOKEN.
 
-Getting an API key (free):
-  1. Sign up at https://www.data.gov.in/
-  2. Go to "My Account" -> "API Key"
-  3. Put it in backend/.env as DATA_GOV_IN_API_KEY
+  2. data.gov.in's own "Real Time Air Quality Index" feed — kept as a
+     secondary source since it's the original CPCB dataset directly, but
+     it's known to be slow/flaky (see the retry logic below). Needs
+     DATA_GOV_IN_API_KEY in backend/.env.
 
-Without a key (or if the request fails / the city has no live stations right now),
-this falls back to representative mock values so the app never breaks.
+  3. Per-city mock baseline — used if neither of the above returns usable
+     data, so the app never breaks.
+
+IMPORTANT UNIT NOTE: WAQI reports each pollutant as an already-computed AQI
+sub-index (0-500 scale), not a raw µg/m³ concentration — confirmed by their
+own sample responses, where e.g. iaqi.pm25.v exactly equals the overall aqi
+value when PM2.5 is the dominant pollutant. Our model needs raw
+concentrations, so WAQI's sub-index values are inverted back through the
+same CPCB breakpoint table (result: an approximate concentration, not a
+measured one) to keep them compatible with the rest of the pipeline. When
+WAQI succeeds, we also keep its own official `aqi` number as
+`reference_aqi` in the result — a ground-truth number you can compare our
+model's estimate against directly, instead of guessing.
 """
 import os
+import time
 import requests
 
-RESOURCE_URL = "https://api.data.gov.in/resource/3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
-
-# CPCB pollutant_id strings -> the feature names our model was trained on
-CPCB_TO_FEATURE = {
-    "PM2.5": "PM2.5",
-    "PM10": "PM10",
-    "NO2": "NO2",
-    "NO": "NO",
-    "NOX": "NOx",
-    "NH3": "NH3",
-    "CO": "CO",
-    "SO2": "SO2",
-    "OZONE": "O3",
+# ---- CPCB breakpoint tables (same methodology as forecast_engine/retrain.py) ----
+BREAKPOINTS = {
+    'PM2.5': [(0, 30, 0, 50), (30, 60, 50, 100), (60, 90, 100, 200), (90, 120, 200, 300), (120, 250, 300, 400), (250, 380, 400, 500)],
+    'PM10':  [(0, 50, 0, 50), (50, 100, 50, 100), (100, 250, 100, 200), (250, 350, 200, 300), (350, 430, 300, 400), (430, 500, 400, 500)],
+    'NO2':   [(0, 40, 0, 50), (40, 80, 50, 100), (80, 180, 100, 200), (180, 280, 200, 300), (280, 400, 300, 400), (400, 500, 400, 500)],
+    'SO2':   [(0, 40, 0, 50), (40, 80, 50, 100), (80, 380, 100, 200), (380, 800, 200, 300), (800, 1600, 300, 400), (1600, 2100, 400, 500)],
+    'CO':    [(0, 1.0, 0, 50), (1.0, 2.0, 50, 100), (2.0, 10, 100, 200), (10, 17, 200, 300), (17, 34, 300, 400), (34, 50, 400, 500)],
+    'O3':    [(0, 50, 0, 50), (50, 100, 50, 100), (100, 168, 100, 200), (168, 208, 200, 300), (208, 748, 300, 400), (748, 1000, 400, 500)],
 }
 
-# Representative fallback values, per city, used when no live reading is
-# available (no API key, no live station for that pollutant/city, or the
-# request fails). These are NOT live data — just rough, city-typical
-# profiles so the demo doesn't collapse to one identical number everywhere.
-# Swap in a real key and these are only ever used as a per-pollutant patch.
+
+def _index_to_concentration(sub_index: float, table) -> float:
+    """Inverse of the CPCB breakpoint formula: given a 0-500 sub-index,
+    return the concentration at the midpoint of the matching segment.
+    Approximate by construction (a whole segment collapses to one point)."""
+    for lo_c, hi_c, lo_i, hi_i in table:
+        if lo_i <= sub_index <= hi_i:
+            frac = (sub_index - lo_i) / (hi_i - lo_i) if hi_i > lo_i else 0.5
+            return lo_c + frac * (hi_c - lo_c)
+    return table[-1][1]  # cap at top of table's concentration range
+
+
+# data.gov.in's API is known to be slow (not down) — a short timeout reads as
+# a hard failure when it's really just latency. Retry a couple of times with
+# a generous timeout before giving up.
+REQUEST_TIMEOUT = 20
+MAX_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = 2
+
+
+def _get_with_retry(url, params, timeout=REQUEST_TIMEOUT):
+    last_exc = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_exc
+
+
+# CPCB pollutant_id strings (data.gov.in feed) -> our feature names
+CPCB_TO_FEATURE = {
+    "PM2.5": "PM2.5", "PM10": "PM10", "NO2": "NO2", "NO": "NO",
+    "NOX": "NOx", "NH3": "NH3", "CO": "CO", "SO2": "SO2", "OZONE": "O3",
+}
+
+# WAQI iaqi keys -> our feature names. WAQI doesn't report NH3/NO/NOx for
+# almost any Indian station, so those three always come from the mock
+# baseline even on a WAQI "live" hit.
+WAQI_TO_FEATURE = {
+    "pm25": "PM2.5", "pm10": "PM10", "no2": "NO2",
+    "so2": "SO2", "co": "CO", "o3": "O3",
+}
+
+# Representative fallback values, per city — NOT live data, just rough
+# city-typical profiles so the demo doesn't collapse to one identical number
+# everywhere when no live source is available. Also fills in any pollutant a
+# live source doesn't report (e.g. NH3/NO/NOx from WAQI).
 DEFAULT_MOCK = {
     'PM2.5': 65.0, 'PM10': 110.0, 'NO': 15.2, 'NO2': 28.4,
     'NOx': 22.1, 'NH3': 12.5, 'CO': 0.9, 'SO2': 14.3, 'O3': 38.0
@@ -53,58 +108,92 @@ CITY_MOCK_POLLUTANTS = {
 }
 
 
-def fetch_live_pollutants(city: str) -> dict:
+def _try_waqi(city: str, lat: float = None, lon: float = None):
     """
-    Returns a dict of all 9 pollutant features. Real CPCB station readings
-    (averaged across stations in the city) are used wherever available;
-    any pollutant missing from the live feed is filled in from that city's
-    mock baseline so the model always receives a complete, valid feature vector.
+    Returns (partial_result_dict, reference_aqi, reason) or (None, None, reason).
 
-    result["_source"] is "live" or "mock".
-    result["_reason"] explains *why* if it's "mock" (no_key / http_error / no_records / request_error / etc.)
-    so a misconfigured key doesn't fail silently.
+    Prefers WAQI's geo lookup (nearest real station to lat/lon) over its
+    plain-name search — name-based /feed/{city}/ only reliably resolves a
+    handful of famous cities (Delhi matches exactly); for others it can match
+    a station or placeholder with no pollutant data at all, which is exactly
+    what "waqi_ok_but_no_matching_pollutants" means. Falls back to name-based
+    lookup only if no coordinates were given.
     """
-    api_key = os.environ.get("DATA_GOV_IN_API_KEY", "").strip().strip('"').strip("'")
-    baseline = CITY_MOCK_POLLUTANTS.get(city, DEFAULT_MOCK)
-    result = dict(baseline)
-    result["_source"] = "mock"
+    token = os.environ.get("WAQI_API_TOKEN", "").strip().strip('"').strip("'")
+    if not token:
+        return None, None, "no_waqi_token"
 
-    if not api_key:
-        result["_reason"] = "no_key"
-        return result
+    if lat is not None and lon is not None:
+        url = f"https://api.waqi.info/feed/geo:{lat};{lon}/"
+    else:
+        url = f"https://api.waqi.info/feed/{city}/"
 
     try:
-        resp = requests.get(
-            RESOURCE_URL,
-            params={
-                "api-key": api_key,
-                "format": "json",
-                "limit": 1000,
-                "filters[city]": city,
-            },
-            timeout=6,
-        )
-
+        resp = _get_with_retry(url, params={"token": token}, timeout=8)
         if resp.status_code != 200:
-            result["_reason"] = f"http_{resp.status_code}: {resp.text[:200]}"
-            return result
+            return None, None, f"waqi_http_{resp.status_code}"
 
         payload = resp.json()
-        records = payload.get("records", [])
+        if payload.get("status") != "ok":
+            return None, None, f"waqi_status_{payload.get('status')}: {payload.get('data')}"
 
+        data = payload["data"]
+        iaqi = data.get("iaqi", {})
+        found = {}
+        for waqi_key, feature in WAQI_TO_FEATURE.items():
+            if waqi_key in iaqi and "v" in iaqi[waqi_key]:
+                sub_index = float(iaqi[waqi_key]["v"])
+                found[feature] = round(_index_to_concentration(sub_index, BREAKPOINTS[feature]), 2)
+
+        if not found:
+            if lat is not None and lon is not None:
+                # Geo lookup resolved to something, but it had no pollutant
+                # data (e.g. a met-only station). Try name-based as a
+                # second attempt before giving up entirely.
+                try:
+                    resp2 = _get_with_retry(f"https://api.waqi.info/feed/{city}/", params={"token": token}, timeout=8)
+                    if resp2.status_code == 200 and resp2.json().get("status") == "ok":
+                        data2 = resp2.json()["data"]
+                        iaqi2 = data2.get("iaqi", {})
+                        found2 = {}
+                        for waqi_key, feature in WAQI_TO_FEATURE.items():
+                            if waqi_key in iaqi2 and "v" in iaqi2[waqi_key]:
+                                found2[feature] = round(_index_to_concentration(float(iaqi2[waqi_key]["v"]), BREAKPOINTS[feature]), 2)
+                        if found2:
+                            ref2 = data2.get("aqi")
+                            station2 = data2.get("city", {}).get("name", city)
+                            return found2, ref2, f"ok ({len(found2)} pollutants via WAQI name-lookup fallback, station: {station2})"
+                except requests.exceptions.RequestException:
+                    pass
+            return None, None, "waqi_ok_but_no_matching_pollutants (nearest station has no live pollutant data)"
+
+        reference_aqi = data.get("aqi")
+        station = data.get("city", {}).get("name", city)
+        return found, reference_aqi, f"ok ({len(found)} pollutants via WAQI, station: {station})"
+
+    except requests.exceptions.RequestException as e:
+        return None, None, f"waqi_request_error: {e}"
+    except Exception as e:
+        return None, None, f"waqi_unexpected_error: {e}"
+
+
+def _try_data_gov_in(city: str):
+    """Returns (partial_result_dict, reason) or (None, reason) on failure."""
+    api_key = os.environ.get("DATA_GOV_IN_API_KEY", "").strip().strip('"').strip("'")
+    if not api_key:
+        return None, "no_data_gov_in_key"
+
+    resource_url = "https://api.data.gov.in/resource/3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
+    try:
+        resp = _get_with_retry(resource_url, params={
+            "api-key": api_key, "format": "json", "limit": 1000, "filters[city]": city,
+        })
+        if resp.status_code != 200:
+            return None, f"http_{resp.status_code}: {resp.text[:200]}"
+
+        records = resp.json().get("records", [])
         if not records:
-            # Try again without the city filter so we can tell "wrong city
-            # spelling" apart from "genuinely no live stations right now".
-            probe = requests.get(
-                RESOURCE_URL,
-                params={"api-key": api_key, "format": "json", "limit": 1},
-                timeout=6,
-            )
-            if probe.status_code == 200 and probe.json().get("records"):
-                result["_reason"] = f"no_records_for_city '{city}' (key works, but this city isn't in the feed right now or the name doesn't match CPCB's spelling)"
-            else:
-                result["_reason"] = f"no_records_at_all (key likely invalid or unauthorized: {probe.status_code})"
-            return result
+            return None, f"no_records_for_city '{city}'"
 
         sums, counts = {}, {}
         for r in records:
@@ -120,19 +209,51 @@ def fetch_live_pollutants(city: str) -> dict:
             counts[feature] = counts.get(feature, 0) + 1
 
         if not sums:
-            result["_reason"] = f"records_found_but_unparseable ({len(records)} records, none matched known pollutant_id values)"
-            return result
+            return None, f"records_found_but_unparseable ({len(records)} records)"
 
-        for feature, total in sums.items():
-            result[feature] = round(total / counts[feature], 2)
-
-        result["_source"] = "live"
-        result["_reason"] = f"ok ({len(records)} station readings)"
-        return result
+        found = {feature: round(total / counts[feature], 2) for feature, total in sums.items()}
+        return found, f"ok ({len(records)} station readings)"
 
     except requests.exceptions.RequestException as e:
-        result["_reason"] = f"request_error: {e}"
-        return result
+        return None, f"request_error: {e}"
     except Exception as e:
-        result["_reason"] = f"unexpected_error: {e}"
-        return result
+        return None, f"unexpected_error: {e}"
+
+
+def fetch_live_pollutants(city: str, lat: float = None, lon: float = None) -> dict:
+    """
+    Returns a dict of all 9 pollutant features (plus "_source", "_reason",
+    and "_reference_aqi" when available). Tries WAQI (geo lookup by
+    lat/lon if given — much more reliable than name search for anything
+    but a handful of famous cities), then data.gov.in, then falls back to
+    that city's mock baseline for anything still missing.
+    """
+    baseline = CITY_MOCK_POLLUTANTS.get(city, DEFAULT_MOCK)
+    result = dict(baseline)
+    reasons = []
+    reference_aqi = None
+    got_any_live = False
+
+    waqi_found, waqi_ref, waqi_reason = _try_waqi(city, lat, lon)
+    reasons.append(f"waqi: {waqi_reason}")
+    if waqi_found:
+        result.update(waqi_found)
+        reference_aqi = waqi_ref
+        got_any_live = True
+
+    # Only fall through to data.gov.in for pollutants WAQI didn't cover
+    # (or if WAQI failed outright) — no point hammering a slow API for
+    # data we already have.
+    still_missing = set(DEFAULT_MOCK) - set(waqi_found or {})
+    if still_missing:
+        dgi_found, dgi_reason = _try_data_gov_in(city)
+        reasons.append(f"data.gov.in: {dgi_reason}")
+        if dgi_found:
+            result.update({k: v for k, v in dgi_found.items() if k in still_missing or k not in (waqi_found or {})})
+            got_any_live = True
+
+    result["_source"] = "live" if got_any_live else "mock"
+    result["_reason"] = " | ".join(reasons)
+    if reference_aqi is not None:
+        result["_reference_aqi"] = reference_aqi
+    return result
