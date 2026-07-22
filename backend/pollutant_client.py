@@ -14,9 +14,32 @@ Without a key (or if the request fails / the city has no live stations right now
 this falls back to representative mock values so the app never breaks.
 """
 import os
+import time
 import requests
 
 RESOURCE_URL = "https://api.data.gov.in/resource/3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"
+
+# data.gov.in's API is known to be slow (not down) — a short timeout reads as
+# a hard failure when it's really just latency. Retry a couple of times with
+# a generous timeout before giving up and falling back to mock.
+REQUEST_TIMEOUT = 20
+MAX_ATTEMPTS = 2
+RETRY_BACKOFF_SECONDS = 2
+
+
+def _get_with_retry(url, params):
+    """GET with retries on timeout/connection errors. Raises the last
+    exception if all attempts fail, so the caller's except block still
+    handles it the same way it always did."""
+    last_exc = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise last_exc
 
 # CPCB pollutant_id strings -> the feature names our model was trained on
 CPCB_TO_FEATURE = {
@@ -74,7 +97,7 @@ def fetch_live_pollutants(city: str) -> dict:
         return result
 
     try:
-        resp = requests.get(
+        resp = _get_with_retry(
             RESOURCE_URL,
             params={
                 "api-key": api_key,
@@ -82,7 +105,6 @@ def fetch_live_pollutants(city: str) -> dict:
                 "limit": 1000,
                 "filters[city]": city,
             },
-            timeout=6,
         )
 
         if resp.status_code != 200:
@@ -95,10 +117,9 @@ def fetch_live_pollutants(city: str) -> dict:
         if not records:
             # Try again without the city filter so we can tell "wrong city
             # spelling" apart from "genuinely no live stations right now".
-            probe = requests.get(
+            probe = _get_with_retry(
                 RESOURCE_URL,
                 params={"api-key": api_key, "format": "json", "limit": 1},
-                timeout=6,
             )
             if probe.status_code == 200 and probe.json().get("records"):
                 result["_reason"] = f"no_records_for_city '{city}' (key works, but this city isn't in the feed right now or the name doesn't match CPCB's spelling)"
