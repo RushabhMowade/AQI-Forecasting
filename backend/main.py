@@ -49,11 +49,7 @@ CITIES = {
     "Nagpur": {"lat": 21.1458, "lon": 79.0882},
 }
 
-<<<<<<< HEAD
 OUTLOOK_DAYS = 3  # 72-hour outlook
-=======
-OUTLOOK_DAYS = 4
->>>>>>> 7513ba1e7f1be6e761605bf24388c936f088c80d
 
 
 @app.get("/api/cities")
@@ -108,13 +104,8 @@ def get_forecast(city: str = Query(..., description="One of /api/cities")):
             "pollutants_reason": pollutant_reason,
             "weather": weather.get("source", "unknown"),
         },
-<<<<<<< HEAD
         # No longer populated (OpenWeather doesn't expose a CPCB-comparable
         # AQI number) -- kept in the response shape for frontend compatibility.
-=======
-        # WAQI's own official AQI number, when available — ground truth to
-        # compare our model's estimate against directly, rather than guessing.
->>>>>>> 7513ba1e7f1be6e761605bf24388c936f088c80d
         "reference_aqi": reference_aqi,
         "current": {"value": round(current_aqi, 1), "label": current_label, "color": current_color},
         "peak": {"value": round(peak_value, 1), "label": peak_label, "color": peak_color, "day": peak_day},
@@ -216,33 +207,17 @@ def get_interventions(city: str = Query(..., description="One of /api/cities")):
 def debug_pollutants(city: str = Query(...)):
     """
     Diagnostic endpoint: shows exactly why a city is or isn't using the live
-<<<<<<< HEAD
     OpenWeather feed, without going through the forecast pipeline. Hit this
     in a browser or with curl to check your API key setup.
     """
     api_key = os.environ.get("OPENWEATHER_API_KEY", "").strip()
     api_key_present = bool(api_key) and api_key != "your_openweather_api_key_here"
-=======
-    CPCB feed, without going through the forecast pipeline. Hit this in a
-    browser or with curl to check your API key setup.
-    """
-    api_key_present = bool(os.environ.get("DATA_GOV_IN_API_KEY", "").strip())
-    waqi_token_present = bool(os.environ.get("WAQI_API_TOKEN", "").strip())
->>>>>>> 7513ba1e7f1be6e761605bf24388c936f088c80d
     coords = CITIES.get(city)
     result = fetch_live_pollutants(city, coords["lat"] if coords else None, coords["lon"] if coords else None)
     return {
         "city": city,
-<<<<<<< HEAD
         "openweather_key_loaded": api_key_present,
         "source": result.get("_source"),
         "reason": result.get("_reason"),
-=======
-        "data_gov_in_key_loaded": api_key_present,
-        "waqi_token_loaded": waqi_token_present,
-        "source": result.get("_source"),
-        "reason": result.get("_reason"),
-        "reference_aqi": result.get("_reference_aqi"),
->>>>>>> 7513ba1e7f1be6e761605bf24388c936f088c80d
         "pollutants": {k: v for k, v in result.items() if not k.startswith("_")},
     }
